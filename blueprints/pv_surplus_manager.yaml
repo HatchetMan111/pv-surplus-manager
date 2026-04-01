@@ -1,0 +1,1141 @@
+blueprint:
+  name: "PV Surplus Manager (Überschussmanager)"
+  description: >
+    🌞 **PV Überschussmanager** – Steuert Verbraucher intelligent nach verfügbarem PV-Überschuss.
+
+    **Features:**
+    - Bis zu 6 Verbraucher mit konfigurierbarer Mindestleistung (W)
+    - Tägliche Prioritätsrotation – automatisch oder manuell via `input_select`
+    - Batterieerhaltung: Batterie soll bis Sonnenuntergang voll geladen sein
+    - PV-Forecast-Integration (Solcast, Forecast.Solar oder eigener Sensor)
+    - Kein Netzbezug für die gesteuerten Verbraucher
+    - Hysteres-Schwellen gegen häufiges Ein-/Ausschalten
+    - Kompatibel mit: SMA, Fronius, Huawei, Solaredge, Sungrow, GoodWe, E3DC u.v.m.
+
+    **Benötigte Helfer (müssen vorher erstellt werden):**
+    - `input_select` für Prioritätsreihenfolge (z. B. `input_select.pv_priority_order`)
+    - Optional: `input_number` für manuelle Mindestbatterie-SoC-Zielwert
+
+    **Anleitung:** https://github.com/YOUR_GITHUB/pv-surplus-manager
+  domain: automation
+  author: "PV Surplus Manager"
+  homeassistant:
+    min_version: "2023.6.0"
+  source_url: https://github.com/YOUR_GITHUB/pv-surplus-manager/blob/main/blueprints/pv_surplus_manager.yaml
+
+  input:
+    # ─────────────────────────────────────────────────
+    # ABSCHNITT 1: PV & Batterie Sensoren
+    # ─────────────────────────────────────────────────
+    section_pv:
+      name: "⚡ PV & Batterie Sensoren"
+      icon: mdi:solar-panel-large
+      collapsed: false
+      input:
+        pv_power_sensor:
+          name: "PV Erzeugungsleistung (W)"
+          description: >
+            Sensor der aktuellen PV-Leistung in Watt.
+            Beispiel: `sensor.solaredge_current_power`
+          selector:
+            entity:
+              domain: sensor
+              device_class: power
+
+        grid_power_sensor:
+          name: "Netzbezugs-/Einspeisung-Sensor (W)"
+          description: >
+            Positiv = Bezug aus dem Netz, Negativ = Einspeisung ins Netz.
+            Beispiel: `sensor.grid_power`
+          selector:
+            entity:
+              domain: sensor
+              device_class: power
+
+        battery_soc_sensor:
+          name: "Batterie Ladestand (SoC in %)"
+          description: >
+            Sensor des Batterie-Ladestands in Prozent (0–100).
+            Beispiel: `sensor.battery_soc`
+          selector:
+            entity:
+              domain: sensor
+              device_class: battery
+
+        battery_power_sensor:
+          name: "Batterie Lade-/Entladeleistung (W)"
+          description: >
+            Positiv = Laden, Negativ = Entladen.
+            Beispiel: `sensor.battery_power`
+          selector:
+            entity:
+              domain: sensor
+              device_class: power
+
+        house_consumption_sensor:
+          name: "Hausverbrauch (W)"
+          description: >
+            Aktueller Gesamtverbrauch des Hauses in Watt (ohne die gesteuerten Geräte).
+            Beispiel: `sensor.house_power_consumption`
+          selector:
+            entity:
+              domain: sensor
+              device_class: power
+
+    # ─────────────────────────────────────────────────
+    # ABSCHNITT 2: PV Forecast
+    # ─────────────────────────────────────────────────
+    section_forecast:
+      name: "☀️ PV Forecast"
+      icon: mdi:weather-sunny
+      collapsed: true
+      input:
+        pv_forecast_today:
+          name: "PV Forecast heute (kWh)"
+          description: >
+            Vorhergesagte PV-Erzeugung für heute in kWh.
+            Solcast: `sensor.solcast_pv_forecast_forecast_today`
+            Forecast.Solar: `sensor.energy_production_today`
+          selector:
+            entity:
+              domain: sensor
+
+        pv_forecast_remaining:
+          name: "PV Forecast verbleibend (kWh)"
+          description: >
+            Noch verbleibende vorhergesagte PV-Erzeugung für heute (optional).
+            Wenn nicht vorhanden, wird `pv_forecast_today` verwendet.
+          default: {}
+          selector:
+            entity:
+              domain: sensor
+
+        battery_capacity_kwh:
+          name: "Batteriekapazität (kWh)"
+          description: "Nutzbare Kapazität der Hausbatterie in kWh."
+          default: 10
+          selector:
+            number:
+              min: 1
+              max: 100
+              step: 0.5
+              unit_of_measurement: "kWh"
+              mode: box
+
+        battery_target_soc:
+          name: "Ziel-SoC am Ende des PV-Tages (%)"
+          description: >
+            Die Batterie soll bis Sonnenuntergang auf diesen Ladestand geladen sein.
+            Empfehlung: 95-100%
+          default: 95
+          selector:
+            number:
+              min: 50
+              max: 100
+              step: 5
+              unit_of_measurement: "%"
+              mode: slider
+
+        sunset_buffer_minutes:
+          name: "Puffer vor Sonnenuntergang (Minuten)"
+          description: >
+            Wie viele Minuten vor Sonnenuntergang die Batterie voll sein soll.
+            Empfehlung: 60–120 Minuten.
+          default: 90
+          selector:
+            number:
+              min: 0
+              max: 240
+              step: 15
+              unit_of_measurement: "min"
+              mode: slider
+
+    # ─────────────────────────────────────────────────
+    # ABSCHNITT 3: Prioritätssteuerung
+    # ─────────────────────────────────────────────────
+    section_priority:
+      name: "🔄 Prioritätssteuerung"
+      icon: mdi:sort-variant
+      collapsed: true
+      input:
+        priority_input_select:
+          name: "Prioritäts-Reihenfolge (input_select)"
+          description: >
+            Ein `input_select` Helfer, der die Reihenfolge steuert. Die Optionen
+            müssen den Verbrauchernamen entsprechen (z.B. `heizstab,heizung1,heizung2`).
+            Die Automation dreht diese Liste täglich weiter.
+          selector:
+            entity:
+              domain: input_select
+
+        auto_rotate_priority:
+          name: "Priorität täglich automatisch rotieren?"
+          description: >
+            Wenn aktiviert, wird die Priorität jeden Tag um Mitternacht automatisch
+            um eine Position weitergedreht.
+          default: true
+          selector:
+            boolean:
+
+        rotation_time:
+          name: "Uhrzeit der täglichen Prioritätsrotation"
+          description: "Zu welcher Uhrzeit soll die Priorität täglich rotieren?"
+          default: "00:05:00"
+          selector:
+            time:
+
+    # ─────────────────────────────────────────────────
+    # ABSCHNITT 4: Verbraucher 1 (Höchste Basispriorität)
+    # ─────────────────────────────────────────────────
+    section_consumer1:
+      name: "🔌 Verbraucher 1 (z.B. Heizstab)"
+      icon: mdi:heating-coil
+      collapsed: true
+      input:
+        consumer1_switch:
+          name: "Schalter Verbraucher 1"
+          selector:
+            entity:
+              domain:
+                - switch
+                - input_boolean
+
+        consumer1_name:
+          name: "Name Verbraucher 1"
+          description: "Muss mit der Option im input_select übereinstimmen!"
+          default: "heizstab"
+          selector:
+            text:
+
+        consumer1_power:
+          name: "Leistung Verbraucher 1 (W)"
+          description: "Nominale Leistungsaufnahme in Watt."
+          default: 2000
+          selector:
+            number:
+              min: 100
+              max: 10000
+              step: 50
+              unit_of_measurement: "W"
+              mode: box
+
+        consumer1_min_soc:
+          name: "Mindest-SoC für Verbraucher 1 (%)"
+          description: "Batterie muss mindestens X% haben, bevor dieser Verbraucher zugeschaltet wird."
+          default: 20
+          selector:
+            number:
+              min: 0
+              max: 95
+              step: 5
+              unit_of_measurement: "%"
+              mode: slider
+
+        consumer1_enabled:
+          name: "Verbraucher 1 aktiviert?"
+          default: true
+          selector:
+            boolean:
+
+    # ─────────────────────────────────────────────────
+    # ABSCHNITT 5: Verbraucher 2
+    # ─────────────────────────────────────────────────
+    section_consumer2:
+      name: "🔌 Verbraucher 2 (z.B. Infrarotheizung 1)"
+      icon: mdi:radiator
+      collapsed: true
+      input:
+        consumer2_switch:
+          name: "Schalter Verbraucher 2"
+          selector:
+            entity:
+              domain:
+                - switch
+                - input_boolean
+
+        consumer2_name:
+          name: "Name Verbraucher 2"
+          default: "heizung1"
+          selector:
+            text:
+
+        consumer2_power:
+          name: "Leistung Verbraucher 2 (W)"
+          default: 1000
+          selector:
+            number:
+              min: 100
+              max: 10000
+              step: 50
+              unit_of_measurement: "W"
+              mode: box
+
+        consumer2_min_soc:
+          name: "Mindest-SoC für Verbraucher 2 (%)"
+          default: 30
+          selector:
+            number:
+              min: 0
+              max: 95
+              step: 5
+              unit_of_measurement: "%"
+              mode: slider
+
+        consumer2_enabled:
+          name: "Verbraucher 2 aktiviert?"
+          default: true
+          selector:
+            boolean:
+
+    # ─────────────────────────────────────────────────
+    # ABSCHNITT 6: Verbraucher 3
+    # ─────────────────────────────────────────────────
+    section_consumer3:
+      name: "🔌 Verbraucher 3 (z.B. Infrarotheizung 2)"
+      icon: mdi:radiator
+      collapsed: true
+      input:
+        consumer3_switch:
+          name: "Schalter Verbraucher 3"
+          selector:
+            entity:
+              domain:
+                - switch
+                - input_boolean
+
+        consumer3_name:
+          name: "Name Verbraucher 3"
+          default: "heizung2"
+          selector:
+            text:
+
+        consumer3_power:
+          name: "Leistung Verbraucher 3 (W)"
+          default: 1000
+          selector:
+            number:
+              min: 100
+              max: 10000
+              step: 50
+              unit_of_measurement: "W"
+              mode: box
+
+        consumer3_min_soc:
+          name: "Mindest-SoC für Verbraucher 3 (%)"
+          default: 40
+          selector:
+            number:
+              min: 0
+              max: 95
+              step: 5
+              unit_of_measurement: "%"
+              mode: slider
+
+        consumer3_enabled:
+          name: "Verbraucher 3 aktiviert?"
+          default: false
+          selector:
+            boolean:
+
+    # ─────────────────────────────────────────────────
+    # ABSCHNITT 7: Verbraucher 4
+    # ─────────────────────────────────────────────────
+    section_consumer4:
+      name: "🔌 Verbraucher 4 (z.B. Heizlüfter)"
+      icon: mdi:fan
+      collapsed: true
+      input:
+        consumer4_switch:
+          name: "Schalter Verbraucher 4"
+          selector:
+            entity:
+              domain:
+                - switch
+                - input_boolean
+
+        consumer4_name:
+          name: "Name Verbraucher 4"
+          default: "heizluefter"
+          selector:
+            text:
+
+        consumer4_power:
+          name: "Leistung Verbraucher 4 (W)"
+          default: 2000
+          selector:
+            number:
+              min: 100
+              max: 10000
+              step: 50
+              unit_of_measurement: "W"
+              mode: box
+
+        consumer4_min_soc:
+          name: "Mindest-SoC für Verbraucher 4 (%)"
+          default: 50
+          selector:
+            number:
+              min: 0
+              max: 95
+              step: 5
+              unit_of_measurement: "%"
+              mode: slider
+
+        consumer4_enabled:
+          name: "Verbraucher 4 aktiviert?"
+          default: false
+          selector:
+            boolean:
+
+    # ─────────────────────────────────────────────────
+    # ABSCHNITT 8: Verbraucher 5
+    # ─────────────────────────────────────────────────
+    section_consumer5:
+      name: "🔌 Verbraucher 5"
+      icon: mdi:power-socket-de
+      collapsed: true
+      input:
+        consumer5_switch:
+          name: "Schalter Verbraucher 5"
+          selector:
+            entity:
+              domain:
+                - switch
+                - input_boolean
+
+        consumer5_name:
+          name: "Name Verbraucher 5"
+          default: "verbraucher5"
+          selector:
+            text:
+
+        consumer5_power:
+          name: "Leistung Verbraucher 5 (W)"
+          default: 1500
+          selector:
+            number:
+              min: 100
+              max: 10000
+              step: 50
+              unit_of_measurement: "W"
+              mode: box
+
+        consumer5_min_soc:
+          name: "Mindest-SoC für Verbraucher 5 (%)"
+          default: 60
+          selector:
+            number:
+              min: 0
+              max: 95
+              step: 5
+              unit_of_measurement: "%"
+              mode: slider
+
+        consumer5_enabled:
+          name: "Verbraucher 5 aktiviert?"
+          default: false
+          selector:
+            boolean:
+
+    # ─────────────────────────────────────────────────
+    # ABSCHNITT 9: Verbraucher 6
+    # ─────────────────────────────────────────────────
+    section_consumer6:
+      name: "🔌 Verbraucher 6"
+      icon: mdi:power-socket-de
+      collapsed: true
+      input:
+        consumer6_switch:
+          name: "Schalter Verbraucher 6"
+          selector:
+            entity:
+              domain:
+                - switch
+                - input_boolean
+
+        consumer6_name:
+          name: "Name Verbraucher 6"
+          default: "verbraucher6"
+          selector:
+            text:
+
+        consumer6_power:
+          name: "Leistung Verbraucher 6 (W)"
+          default: 1500
+          selector:
+            number:
+              min: 100
+              max: 10000
+              step: 50
+              unit_of_measurement: "W"
+              mode: box
+
+        consumer6_min_soc:
+          name: "Mindest-SoC für Verbraucher 6 (%)"
+          default: 70
+          selector:
+            number:
+              min: 0
+              max: 95
+              step: 5
+              unit_of_measurement: "%"
+              mode: slider
+
+        consumer6_enabled:
+          name: "Verbraucher 6 aktiviert?"
+          default: false
+          selector:
+            boolean:
+
+    # ─────────────────────────────────────────────────
+    # ABSCHNITT 10: Schwellen & Timing
+    # ─────────────────────────────────────────────────
+    section_thresholds:
+      name: "⚙️ Schwellen & Timing"
+      icon: mdi:tune
+      collapsed: true
+      input:
+        surplus_hysteresis_on:
+          name: "Einschaltschwelle Überschuss (W)"
+          description: >
+            Wie viel Watt PV-Überschuss muss vorhanden sein, damit ein Verbraucher
+            eingeschaltet wird (zusätzlich zur Geräteleistung). Verhindert Netzeinspeisung.
+          default: 100
+          selector:
+            number:
+              min: 0
+              max: 500
+              step: 50
+              unit_of_measurement: "W"
+              mode: slider
+
+        surplus_hysteresis_off:
+          name: "Abschaltschwelle Netzbezug (W)"
+          description: >
+            Wie viel Watt Netzbezug toleriert werden, bevor ein Verbraucher ausgeschaltet wird.
+            Empfehlung: 50–200W (Puffer gegen kurze Wolken).
+          default: 100
+          selector:
+            number:
+              min: 0
+              max: 500
+              step: 50
+              unit_of_measurement: "W"
+              mode: slider
+
+        check_interval:
+          name: "Prüfintervall (Sekunden)"
+          description: "Wie oft soll die Logik ausgeführt werden?"
+          default: 30
+          selector:
+            number:
+              min: 10
+              max: 300
+              step: 10
+              unit_of_measurement: "s"
+              mode: slider
+
+        min_on_time:
+          name: "Mindest-Einschaltdauer (Sekunden)"
+          description: >
+            Ein Verbraucher bleibt mindestens diese Zeit eingeschaltet, bevor er wieder
+            ausgeschaltet werden kann. Schützt Kompressoren und Heizelemente.
+          default: 300
+          selector:
+            number:
+              min: 60
+              max: 1800
+              step: 60
+              unit_of_measurement: "s"
+              mode: box
+
+        battery_reserve_emergency:
+          name: "Notfall-SoC Schwelle (%)"
+          description: >
+            Fällt die Batterie unter diesen Wert, werden ALLE gesteuerten Verbraucher
+            sofort ausgeschaltet – unabhängig von PV-Leistung.
+          default: 10
+          selector:
+            number:
+              min: 0
+              max: 50
+              step: 5
+              unit_of_measurement: "%"
+              mode: slider
+
+        battery_priority_threshold:
+          name: "Batterie-Priorisierungs-Schwelle (%)"
+          description: >
+            Unterhalb dieses SoC geht der gesamte PV-Überschuss erst in die Batterie,
+            bevor Verbraucher zugeschaltet werden.
+          default: 50
+          selector:
+            number:
+              min: 10
+              max: 90
+              step: 5
+              unit_of_measurement: "%"
+              mode: slider
+
+# ═══════════════════════════════════════════════════════════════════
+# VARIABLEN
+# ═══════════════════════════════════════════════════════════════════
+variables:
+  # Sensoren
+  pv_power: "{{ states(pv_power_sensor) | float(0) }}"
+  grid_power: "{{ states(grid_power_sensor) | float(0) }}"
+  battery_soc: "{{ states(battery_soc_sensor) | float(0) }}"
+  battery_power: "{{ states(battery_power_sensor) | float(0) }}"
+
+  # Verfügbarer Überschuss = PV - Hausverbrauch - Batterie-Laden (wenn negativ = Entladen)
+  # Netzbezug ist positiv, Einspeisung ist negativ
+  # Überschuss = -1 * grid_power (wenn negativ = Einspeisung = Überschuss)
+  available_surplus: >-
+    {{ ([(-1 * states(grid_power_sensor) | float(0)), 0] | max) }}
+
+  # Wie viel Watt noch in die Batterie können/müssen
+  battery_missing_kwh: >-
+    {% set cap = battery_capacity_kwh | float(10) %}
+    {% set target = battery_target_soc | float(95) %}
+    {% set soc = states(battery_soc_sensor) | float(0) %}
+    {{ [((target - soc) / 100) * cap, 0] | max }}
+
+  # Prioritätsreihenfolge aus input_select (kommagetrennte Namen)
+  priority_order: >-
+    {{ states(priority_input_select) }}
+
+  # Sonnenuntergang heute (Unix-Timestamp)
+  sunset_today: >-
+    {{ as_timestamp(state_attr('sun.sun', 'next_setting')) }}
+
+  # Sekunden bis Sonnenuntergang
+  seconds_to_sunset: >-
+    {{ [sunset_today - as_timestamp(now()), 0] | max }}
+
+  # Muss die Batterie Vorrang haben?
+  battery_needs_priority: >-
+    {% set soc = states(battery_soc_sensor) | float(0) %}
+    {% set missing_kwh = battery_missing_kwh %}
+    {% set hours_left = seconds_to_sunset / 3600 %}
+    {% set forecast_rem = states(pv_forecast_remaining) | float(states(pv_forecast_today) | float(0)) %}
+    {# Wenn wenig Zeit und Batterie nicht voll: Batterie priorisieren #}
+    {{ soc < battery_priority_threshold | float(50) or
+       (missing_kwh > 0 and hours_left < 3 and forecast_rem < missing_kwh * 1.2) }}
+
+# ═══════════════════════════════════════════════════════════════════
+# TRIGGER
+# ═══════════════════════════════════════════════════════════════════
+trigger:
+  # Zeitbasierter Trigger (Hauptschleife)
+  - platform: time_pattern
+    seconds: "/{{ check_interval }}"
+    id: "check_cycle"
+
+  # Prioritätsrotation
+  - platform: time
+    at: !input rotation_time
+    id: "rotate_priority"
+
+  # Notfall: Batterie sehr niedrig
+  - platform: numeric_state
+    entity_id: !input battery_soc_sensor
+    below: !input battery_reserve_emergency
+    id: "battery_emergency"
+
+  # PV startet morgens (vermeidet unnötige Ausführung in der Nacht)
+  - platform: numeric_state
+    entity_id: !input pv_power_sensor
+    above: 100
+    id: "pv_started"
+
+  # PV hört auf (Abend)
+  - platform: numeric_state
+    entity_id: !input pv_power_sensor
+    below: 50
+    for:
+      minutes: 5
+    id: "pv_stopped"
+
+# ═══════════════════════════════════════════════════════════════════
+# BEDINGUNGEN
+# ═══════════════════════════════════════════════════════════════════
+condition: []
+
+# ═══════════════════════════════════════════════════════════════════
+# AKTIONEN
+# ═══════════════════════════════════════════════════════════════════
+action:
+  - choose:
+
+    # ───────────────────────────────────────────────
+    # FALL 1: Prioritätsrotation
+    # ───────────────────────────────────────────────
+    - conditions:
+        - condition: trigger
+          id: "rotate_priority"
+        - condition: template
+          value_template: "{{ auto_rotate_priority }}"
+      sequence:
+        - service: input_select.select_next
+          target:
+            entity_id: !input priority_input_select
+        - service: persistent_notification.create
+          data:
+            title: "🔄 PV Priorität rotiert"
+            message: >
+              Die Verbraucher-Priorität wurde rotiert.
+              Aktuelle Priorität: {{ states(priority_input_select) }}
+            notification_id: "pv_priority_rotated"
+
+    # ───────────────────────────────────────────────
+    # FALL 2: Notfall – Batterie zu niedrig
+    # ───────────────────────────────────────────────
+    - conditions:
+        - condition: trigger
+          id: "battery_emergency"
+      sequence:
+        - if:
+            - condition: template
+              value_template: "{{ consumer1_enabled }}"
+          then:
+            - service: homeassistant.turn_off
+              target:
+                entity_id: !input consumer1_switch
+        - if:
+            - condition: template
+              value_template: "{{ consumer2_enabled }}"
+          then:
+            - service: homeassistant.turn_off
+              target:
+                entity_id: !input consumer2_switch
+        - if:
+            - condition: template
+              value_template: "{{ consumer3_enabled }}"
+          then:
+            - service: homeassistant.turn_off
+              target:
+                entity_id: !input consumer3_switch
+        - if:
+            - condition: template
+              value_template: "{{ consumer4_enabled }}"
+          then:
+            - service: homeassistant.turn_off
+              target:
+                entity_id: !input consumer4_switch
+        - if:
+            - condition: template
+              value_template: "{{ consumer5_enabled }}"
+          then:
+            - service: homeassistant.turn_off
+              target:
+                entity_id: !input consumer5_switch
+        - if:
+            - condition: template
+              value_template: "{{ consumer6_enabled }}"
+          then:
+            - service: homeassistant.turn_off
+              target:
+                entity_id: !input consumer6_switch
+        - service: persistent_notification.create
+          data:
+            title: "🔴 PV Manager: Batterie-Notfall!"
+            message: >
+              Batterie SoC: {{ battery_soc | round(1) }}% – unter Notfallschwelle ({{ battery_reserve_emergency }}%).
+              Alle Verbraucher wurden ausgeschaltet!
+            notification_id: "pv_battery_emergency"
+
+    # ───────────────────────────────────────────────
+    # FALL 3: PV hört auf – alle ausschalten
+    # ───────────────────────────────────────────────
+    - conditions:
+        - condition: trigger
+          id: "pv_stopped"
+      sequence:
+        - if:
+            - condition: template
+              value_template: "{{ consumer1_enabled }}"
+          then:
+            - service: homeassistant.turn_off
+              target:
+                entity_id: !input consumer1_switch
+        - if:
+            - condition: template
+              value_template: "{{ consumer2_enabled }}"
+          then:
+            - service: homeassistant.turn_off
+              target:
+                entity_id: !input consumer2_switch
+        - if:
+            - condition: template
+              value_template: "{{ consumer3_enabled }}"
+          then:
+            - service: homeassistant.turn_off
+              target:
+                entity_id: !input consumer3_switch
+        - if:
+            - condition: template
+              value_template: "{{ consumer4_enabled }}"
+          then:
+            - service: homeassistant.turn_off
+              target:
+                entity_id: !input consumer4_switch
+        - if:
+            - condition: template
+              value_template: "{{ consumer5_enabled }}"
+          then:
+            - service: homeassistant.turn_off
+              target:
+                entity_id: !input consumer5_switch
+        - if:
+            - condition: template
+              value_template: "{{ consumer6_enabled }}"
+          then:
+            - service: homeassistant.turn_off
+              target:
+                entity_id: !input consumer6_switch
+
+    # ───────────────────────────────────────────────
+    # FALL 4: Hauptsteuerungslogik (Regelschleife)
+    # ───────────────────────────────────────────────
+    - conditions:
+        - condition: trigger
+          id:
+            - "check_cycle"
+            - "pv_started"
+        # Nur tagsüber (wenn PV > 0 oder kurz danach)
+        - condition: numeric_state
+          entity_id: !input pv_power_sensor
+          above: 0
+        # Kein Notfall
+        - condition: template
+          value_template: >
+            {{ states(battery_soc_sensor) | float(0) > battery_reserve_emergency | float(10) }}
+      sequence:
+        # ── Schritt 1: Berechne effektiven Überschuss nach Batteriebedarf ──
+        - variables:
+            current_surplus: "{{ available_surplus | float(0) }}"
+            batt_soc: "{{ states(battery_soc_sensor) | float(0) }}"
+            needs_battery_first: "{{ battery_needs_priority }}"
+
+            # Sortiere Verbraucher nach aktueller Priorität
+            # priority_order enthält z.B. "heizstab,heizung1,heizung2"
+            prio_list: >-
+              {{ priority_order.split(',') | map('trim') | list }}
+
+            # Baue Liste aller konfigurierten Verbraucher
+            consumers: >-
+              {% set ns = namespace(lst=[]) %}
+              {% if consumer1_enabled %}
+                {% set ns.lst = ns.lst + [{
+                  'name': consumer1_name,
+                  'switch': consumer1_switch | string,
+                  'power': consumer1_power | float(0),
+                  'min_soc': consumer1_min_soc | float(0)
+                }] %}
+              {% endif %}
+              {% if consumer2_enabled %}
+                {% set ns.lst = ns.lst + [{
+                  'name': consumer2_name,
+                  'switch': consumer2_switch | string,
+                  'power': consumer2_power | float(0),
+                  'min_soc': consumer2_min_soc | float(0)
+                }] %}
+              {% endif %}
+              {% if consumer3_enabled %}
+                {% set ns.lst = ns.lst + [{
+                  'name': consumer3_name,
+                  'switch': consumer3_switch | string,
+                  'power': consumer3_power | float(0),
+                  'min_soc': consumer3_min_soc | float(0)
+                }] %}
+              {% endif %}
+              {% if consumer4_enabled %}
+                {% set ns.lst = ns.lst + [{
+                  'name': consumer4_name,
+                  'switch': consumer4_switch | string,
+                  'power': consumer4_power | float(0),
+                  'min_soc': consumer4_min_soc | float(0)
+                }] %}
+              {% endif %}
+              {% if consumer5_enabled %}
+                {% set ns.lst = ns.lst + [{
+                  'name': consumer5_name,
+                  'switch': consumer5_switch | string,
+                  'power': consumer5_power | float(0),
+                  'min_soc': consumer5_min_soc | float(0)
+                }] %}
+              {% endif %}
+              {% if consumer6_enabled %}
+                {% set ns.lst = ns.lst + [{
+                  'name': consumer6_name,
+                  'switch': consumer6_switch | string,
+                  'power': consumer6_power | float(0),
+                  'min_soc': consumer6_min_soc | float(0)
+                }] %}
+              {% endif %}
+              {{ ns.lst }}
+
+        # ── Schritt 2: Verbraucher 1 steuern ──
+        - if:
+            - condition: template
+              value_template: "{{ consumer1_enabled }}"
+          then:
+            - variables:
+                c1_should_on: >-
+                  {% set soc = states(battery_soc_sensor) | float(0) %}
+                  {% set surplus = available_surplus | float(0) %}
+                  {% set pwr = consumer1_power | float(0) %}
+                  {% set hysteresis_on = surplus_hysteresis_on | float(100) %}
+                  {% set hysteresis_off = surplus_hysteresis_off | float(100) %}
+                  {% set is_on = is_state(consumer1_switch, 'on') %}
+                  {% set batt_ok = soc >= consumer1_min_soc | float(0) %}
+                  {% set batt_prio = battery_needs_priority %}
+                  {% if batt_prio and soc < battery_target_soc | float(95) %}
+                    {{ false }}
+                  {% elif not batt_ok %}
+                    {{ false }}
+                  {% elif is_on %}
+                    {# Ausschalten wenn Netzbezug > Hysterese #}
+                    {{ states(grid_power_sensor) | float(0) < hysteresis_off }}
+                  {% else %}
+                    {# Einschalten wenn genug Überschuss #}
+                    {{ surplus >= (pwr + hysteresis_on) }}
+                  {% endif %}
+            - choose:
+                - conditions:
+                    - condition: template
+                      value_template: "{{ c1_should_on and not is_state(consumer1_switch, 'on') }}"
+                  sequence:
+                    - service: homeassistant.turn_on
+                      target:
+                        entity_id: !input consumer1_switch
+                - conditions:
+                    - condition: template
+                      value_template: "{{ not c1_should_on and is_state(consumer1_switch, 'on') }}"
+                  sequence:
+                    - service: homeassistant.turn_off
+                      target:
+                        entity_id: !input consumer1_switch
+
+        # ── Schritt 3: Verbraucher 2 steuern ──
+        - if:
+            - condition: template
+              value_template: "{{ consumer2_enabled }}"
+          then:
+            - variables:
+                c2_should_on: >-
+                  {% set soc = states(battery_soc_sensor) | float(0) %}
+                  {% set surplus = available_surplus | float(0) %}
+                  {% set pwr = consumer2_power | float(0) %}
+                  {% set hysteresis_on = surplus_hysteresis_on | float(100) %}
+                  {% set hysteresis_off = surplus_hysteresis_off | float(100) %}
+                  {% set is_on = is_state(consumer2_switch, 'on') %}
+                  {% set batt_ok = soc >= consumer2_min_soc | float(0) %}
+                  {% set batt_prio = battery_needs_priority %}
+                  {% set c1_on_power = (consumer1_power | float(0) if is_state(consumer1_switch, 'on') else 0) %}
+                  {% set remaining = surplus - c1_on_power %}
+                  {% if batt_prio and soc < battery_target_soc | float(95) %}
+                    {{ false }}
+                  {% elif not batt_ok %}
+                    {{ false }}
+                  {% elif is_on %}
+                    {{ states(grid_power_sensor) | float(0) < hysteresis_off }}
+                  {% else %}
+                    {{ remaining >= (pwr + hysteresis_on) }}
+                  {% endif %}
+            - choose:
+                - conditions:
+                    - condition: template
+                      value_template: "{{ c2_should_on and not is_state(consumer2_switch, 'on') }}"
+                  sequence:
+                    - service: homeassistant.turn_on
+                      target:
+                        entity_id: !input consumer2_switch
+                - conditions:
+                    - condition: template
+                      value_template: "{{ not c2_should_on and is_state(consumer2_switch, 'on') }}"
+                  sequence:
+                    - service: homeassistant.turn_off
+                      target:
+                        entity_id: !input consumer2_switch
+
+        # ── Schritt 4: Verbraucher 3 steuern ──
+        - if:
+            - condition: template
+              value_template: "{{ consumer3_enabled }}"
+          then:
+            - variables:
+                c3_should_on: >-
+                  {% set soc = states(battery_soc_sensor) | float(0) %}
+                  {% set surplus = available_surplus | float(0) %}
+                  {% set pwr = consumer3_power | float(0) %}
+                  {% set hysteresis_on = surplus_hysteresis_on | float(100) %}
+                  {% set hysteresis_off = surplus_hysteresis_off | float(100) %}
+                  {% set is_on = is_state(consumer3_switch, 'on') %}
+                  {% set batt_ok = soc >= consumer3_min_soc | float(0) %}
+                  {% set batt_prio = battery_needs_priority %}
+                  {% set c1_on_power = (consumer1_power | float(0) if is_state(consumer1_switch, 'on') else 0) %}
+                  {% set c2_on_power = (consumer2_power | float(0) if is_state(consumer2_switch, 'on') else 0) %}
+                  {% set remaining = surplus - c1_on_power - c2_on_power %}
+                  {% if batt_prio and soc < battery_target_soc | float(95) %}
+                    {{ false }}
+                  {% elif not batt_ok %}
+                    {{ false }}
+                  {% elif is_on %}
+                    {{ states(grid_power_sensor) | float(0) < hysteresis_off }}
+                  {% else %}
+                    {{ remaining >= (pwr + hysteresis_on) }}
+                  {% endif %}
+            - choose:
+                - conditions:
+                    - condition: template
+                      value_template: "{{ c3_should_on and not is_state(consumer3_switch, 'on') }}"
+                  sequence:
+                    - service: homeassistant.turn_on
+                      target:
+                        entity_id: !input consumer3_switch
+                - conditions:
+                    - condition: template
+                      value_template: "{{ not c3_should_on and is_state(consumer3_switch, 'on') }}"
+                  sequence:
+                    - service: homeassistant.turn_off
+                      target:
+                        entity_id: !input consumer3_switch
+
+        # ── Schritt 5: Verbraucher 4 steuern ──
+        - if:
+            - condition: template
+              value_template: "{{ consumer4_enabled }}"
+          then:
+            - variables:
+                c4_should_on: >-
+                  {% set soc = states(battery_soc_sensor) | float(0) %}
+                  {% set surplus = available_surplus | float(0) %}
+                  {% set pwr = consumer4_power | float(0) %}
+                  {% set hysteresis_on = surplus_hysteresis_on | float(100) %}
+                  {% set hysteresis_off = surplus_hysteresis_off | float(100) %}
+                  {% set is_on = is_state(consumer4_switch, 'on') %}
+                  {% set batt_ok = soc >= consumer4_min_soc | float(0) %}
+                  {% set batt_prio = battery_needs_priority %}
+                  {% set c1_p = (consumer1_power | float(0) if is_state(consumer1_switch, 'on') else 0) %}
+                  {% set c2_p = (consumer2_power | float(0) if is_state(consumer2_switch, 'on') else 0) %}
+                  {% set c3_p = (consumer3_power | float(0) if is_state(consumer3_switch, 'on') else 0) %}
+                  {% set remaining = surplus - c1_p - c2_p - c3_p %}
+                  {% if batt_prio and soc < battery_target_soc | float(95) %}
+                    {{ false }}
+                  {% elif not batt_ok %}
+                    {{ false }}
+                  {% elif is_on %}
+                    {{ states(grid_power_sensor) | float(0) < hysteresis_off }}
+                  {% else %}
+                    {{ remaining >= (pwr + hysteresis_on) }}
+                  {% endif %}
+            - choose:
+                - conditions:
+                    - condition: template
+                      value_template: "{{ c4_should_on and not is_state(consumer4_switch, 'on') }}"
+                  sequence:
+                    - service: homeassistant.turn_on
+                      target:
+                        entity_id: !input consumer4_switch
+                - conditions:
+                    - condition: template
+                      value_template: "{{ not c4_should_on and is_state(consumer4_switch, 'on') }}"
+                  sequence:
+                    - service: homeassistant.turn_off
+                      target:
+                        entity_id: !input consumer4_switch
+
+        # ── Schritt 6: Verbraucher 5 steuern ──
+        - if:
+            - condition: template
+              value_template: "{{ consumer5_enabled }}"
+          then:
+            - variables:
+                c5_should_on: >-
+                  {% set soc = states(battery_soc_sensor) | float(0) %}
+                  {% set surplus = available_surplus | float(0) %}
+                  {% set pwr = consumer5_power | float(0) %}
+                  {% set hysteresis_on = surplus_hysteresis_on | float(100) %}
+                  {% set hysteresis_off = surplus_hysteresis_off | float(100) %}
+                  {% set is_on = is_state(consumer5_switch, 'on') %}
+                  {% set batt_ok = soc >= consumer5_min_soc | float(0) %}
+                  {% set batt_prio = battery_needs_priority %}
+                  {% set c1_p = (consumer1_power | float(0) if is_state(consumer1_switch, 'on') else 0) %}
+                  {% set c2_p = (consumer2_power | float(0) if is_state(consumer2_switch, 'on') else 0) %}
+                  {% set c3_p = (consumer3_power | float(0) if is_state(consumer3_switch, 'on') else 0) %}
+                  {% set c4_p = (consumer4_power | float(0) if is_state(consumer4_switch, 'on') else 0) %}
+                  {% set remaining = surplus - c1_p - c2_p - c3_p - c4_p %}
+                  {% if batt_prio and soc < battery_target_soc | float(95) %}
+                    {{ false }}
+                  {% elif not batt_ok %}
+                    {{ false }}
+                  {% elif is_on %}
+                    {{ states(grid_power_sensor) | float(0) < hysteresis_off }}
+                  {% else %}
+                    {{ remaining >= (pwr + hysteresis_on) }}
+                  {% endif %}
+            - choose:
+                - conditions:
+                    - condition: template
+                      value_template: "{{ c5_should_on and not is_state(consumer5_switch, 'on') }}"
+                  sequence:
+                    - service: homeassistant.turn_on
+                      target:
+                        entity_id: !input consumer5_switch
+                - conditions:
+                    - condition: template
+                      value_template: "{{ not c5_should_on and is_state(consumer5_switch, 'on') }}"
+                  sequence:
+                    - service: homeassistant.turn_off
+                      target:
+                        entity_id: !input consumer5_switch
+
+        # ── Schritt 7: Verbraucher 6 steuern ──
+        - if:
+            - condition: template
+              value_template: "{{ consumer6_enabled }}"
+          then:
+            - variables:
+                c6_should_on: >-
+                  {% set soc = states(battery_soc_sensor) | float(0) %}
+                  {% set surplus = available_surplus | float(0) %}
+                  {% set pwr = consumer6_power | float(0) %}
+                  {% set hysteresis_on = surplus_hysteresis_on | float(100) %}
+                  {% set hysteresis_off = surplus_hysteresis_off | float(100) %}
+                  {% set is_on = is_state(consumer6_switch, 'on') %}
+                  {% set batt_ok = soc >= consumer6_min_soc | float(0) %}
+                  {% set batt_prio = battery_needs_priority %}
+                  {% set c1_p = (consumer1_power | float(0) if is_state(consumer1_switch, 'on') else 0) %}
+                  {% set c2_p = (consumer2_power | float(0) if is_state(consumer2_switch, 'on') else 0) %}
+                  {% set c3_p = (consumer3_power | float(0) if is_state(consumer3_switch, 'on') else 0) %}
+                  {% set c4_p = (consumer4_power | float(0) if is_state(consumer4_switch, 'on') else 0) %}
+                  {% set c5_p = (consumer5_power | float(0) if is_state(consumer5_switch, 'on') else 0) %}
+                  {% set remaining = surplus - c1_p - c2_p - c3_p - c4_p - c5_p %}
+                  {% if batt_prio and soc < battery_target_soc | float(95) %}
+                    {{ false }}
+                  {% elif not batt_ok %}
+                    {{ false }}
+                  {% elif is_on %}
+                    {{ states(grid_power_sensor) | float(0) < hysteresis_off }}
+                  {% else %}
+                    {{ remaining >= (pwr + hysteresis_on) }}
+                  {% endif %}
+            - choose:
+                - conditions:
+                    - condition: template
+                      value_template: "{{ c6_should_on and not is_state(consumer6_switch, 'on') }}"
+                  sequence:
+                    - service: homeassistant.turn_on
+                      target:
+                        entity_id: !input consumer6_switch
+                - conditions:
+                    - condition: template
+                      value_template: "{{ not c6_should_on and is_state(consumer6_switch, 'on') }}"
+                  sequence:
+                    - service: homeassistant.turn_off
+                      target:
+                        entity_id: !input consumer6_switch
+
+mode: single
+max_exceeded: silent
