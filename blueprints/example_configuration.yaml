@@ -1,0 +1,103 @@
+# Beispiel-Konfiguration für PV Surplus Manager
+# Speichere diese Datei als: /config/packages/pv_surplus_manager.yaml
+# Stelle sicher, dass in der configuration.yaml steht:
+#   homeassistant:
+#     packages: !include_dir_named packages/
+
+# ═══════════════════════════════════════════════════════════
+# HELFER (Helpers) – Passe die Optionen an deine Verbraucher an!
+# ═══════════════════════════════════════════════════════════
+
+input_select:
+  pv_priority_order:
+    name: "PV Verbraucher Priorität"
+    options:
+      # Reihenfolge: Wer bekommt zuerst Überschuss?
+      # Tag 1: Heizstab hat höchste Priorität
+      - "heizstab,heizung1,heizung2,heizluefter"
+      # Tag 2: Infrarotheizung 1 hat höchste Priorität
+      - "heizung1,heizung2,heizluefter,heizstab"
+      # Tag 3: Infrarotheizung 2 hat höchste Priorität
+      - "heizung2,heizluefter,heizstab,heizung1"
+      # Tag 4: Heizlüfter hat höchste Priorität
+      - "heizluefter,heizstab,heizung1,heizung2"
+    initial: "heizstab,heizung1,heizung2,heizluefter"
+    icon: mdi:sort-variant
+
+# ═══════════════════════════════════════════════════════════
+# TEMPLATE SENSOREN – Nützliche Anzeige-Sensoren
+# ═══════════════════════════════════════════════════════════
+
+template:
+  - sensor:
+      # Verfügbarer PV-Überschuss in Watt
+      # Anpassen: Ersetze sensor.grid_power durch deinen Sensor
+      - name: "PV Überschuss verfügbar"
+        unique_id: pv_surplus_available
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        state: >-
+          {% set grid = states('sensor.grid_power') | float(0) %}
+          {{ [(-1 * grid), 0] | max | round(0) }}
+        icon: >-
+          {% if states('sensor.grid_power') | float(0) < 0 %}
+            mdi:transmission-tower-export
+          {% else %}
+            mdi:transmission-tower-import
+          {% endif %}
+
+      # Status-Sensor für das Dashboard
+      - name: "PV Manager Status"
+        unique_id: pv_manager_status
+        state: >-
+          {% set soc = states('sensor.battery_soc') | float(0) %}
+          {% set grid = states('sensor.grid_power') | float(0) %}
+          {% set pv = states('sensor.pv_power') | float(0) %}
+          {% if pv < 50 %}
+            Nacht / kein PV
+          {% elif soc < 10 %}
+            🔴 Batterie-Notfall
+          {% elif soc < 50 %}
+            🟡 Batterie laden (Priorität)
+          {% elif grid < -100 %}
+            🟢 Überschuss vorhanden
+          {% else %}
+            🔵 Ausbalanciert
+          {% endif %}
+        icon: mdi:solar-power-variant
+
+# ═══════════════════════════════════════════════════════════
+# DASHBOARD KARTE (Lovelace YAML)
+# Füge dies zu deinem Dashboard hinzu
+# ═══════════════════════════════════════════════════════════
+
+# Kopiere den folgenden Block in dein Lovelace-Dashboard:
+#
+# type: vertical-stack
+# cards:
+#   - type: markdown
+#     content: "## 🌞 PV Überschussmanager"
+#   - type: glance
+#     entities:
+#       - entity: sensor.pv_power
+#         name: PV Leistung
+#       - entity: sensor.pv_ueberschuss_verfuegbar
+#         name: Überschuss
+#       - entity: sensor.battery_soc
+#         name: Batterie
+#       - entity: sensor.pv_manager_status
+#         name: Status
+#   - type: entities
+#     title: Verbraucher
+#     entities:
+#       - entity: input_select.pv_priority_order
+#         name: Aktuelle Priorität
+#       - entity: switch.heizstab
+#         name: 🔥 Heizstab
+#       - entity: switch.infrarotheizung_1
+#         name: 📡 Infrarotheizung 1
+#       - entity: switch.infrarotheizung_2
+#         name: 📡 Infrarotheizung 2
+#       - entity: switch.heizluefter
+#         name: 💨 Heizlüfter
